@@ -13,11 +13,11 @@ if (keystorePropertiesFile.exists()) {
 }
 
 android {
-    namespace = "com.blissless.tensei_extension_template"
+    namespace = "com.blissless.megaplay"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.blissless.tensei_extension_template"
+        applicationId = "com.blissless.megaplay"
         minSdk = 26
         targetSdk = 37
         versionCode = 1
