@@ -79,10 +79,12 @@ class ScraperProvider : ContentProvider() {
     /**
      * Convert the result map to a JSON string.
      *
-     * Handles three shapes:
-     *   {"error": "..."}        — error message
-     *   {"url": "..."}          — single stream URL (Mode 2)
-     *   {"episodes": [...]}     — episode list (Mode 1)
+     * Handles four shapes:
+     *   {"error": "..."}                       — error message
+     *   {"url": "...", "headers": {...},
+     *    "url_with_headers": "...",
+     *    "subtitles": [...]}                   — single stream URL (Mode 2)
+     *   {"episodes": [...]}                    — episode list (Mode 1)
      */
     @Suppress("UNCHECKED_CAST")
     private fun serialiseResult(result: Map<String, Any>): String {
@@ -95,6 +97,37 @@ class ScraperProvider : ContentProvider() {
 
         if (result.containsKey("url")) {
             obj.put("url", result["url"].toString())
+
+            // Serialise the headers map (if present) as a JSON object
+            val headers = result["headers"] as? Map<String, String>
+            if (headers != null) {
+                val headersObj = JSONObject()
+                for ((k, v) in headers) {
+                    headersObj.put(k, v)
+                }
+                obj.put("headers", headersObj)
+            }
+
+            // Include the pipe-encoded URL (if present) for players that
+            // support the `url|Header=value&...` format.
+            result["url_with_headers"]?.let { obj.put("url_with_headers", it.toString()) }
+
+            // Serialise the subtitles array (if present).
+            // Each entry: {"label": "...", "language": "...", "url": "...", "default": bool}
+            val subtitles = result["subtitles"] as? List<Map<String, Any>>
+            if (subtitles != null) {
+                val subsArr = JSONArray()
+                for (sub in subtitles) {
+                    val subObj = JSONObject()
+                    subObj.put("label", sub["label"].toString())
+                    subObj.put("language", sub["language"].toString())
+                    subObj.put("url", sub["url"].toString())
+                    subObj.put("default", sub["default"] as Boolean)
+                    subsArr.put(subObj)
+                }
+                obj.put("subtitles", subsArr)
+            }
+
             return obj.toString()
         }
 

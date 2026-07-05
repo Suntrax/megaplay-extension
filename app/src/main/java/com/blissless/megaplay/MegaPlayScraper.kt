@@ -138,7 +138,31 @@ object MegaPlayScraper {
      * megaplay returns IS one of mkissa's source URLs. We use megaplay
      * directly because it works via plain HTTP (no Cloudflare, no WebView).
      *
-     * @return {"url": "https://...m3u8"} or {"error": "..."} on failure.
+     * The stream CDN (nekostream.site) requires a `Referer: https://megaplay.buzz/`
+     * header on every request (master m3u8, sub-playlist, AND segment files).
+     * Without it, the CDN returns HTTP 403. We return the required headers
+     * alongside the URL so the player app can attach them.
+     *
+     * Megaplay also returns a `tracks` array of soft-subtitle VTT files
+     * (one per language). These are NOT burned into the video — the player
+     * renders them as a separate overlay. We pass them through as a
+     * `subtitles` array so the player can offer language switching.
+     *
+     * The subtitle files are hosted on a different CDN (lostproject.club)
+     * but share the same hash path as the video, so they require the same
+     * `Referer: https://megaplay.buzz/` header.
+     *
+     * @return A map with:
+     *           {"url": "https://...m3u8",
+     *            "headers": {"Referer": "...", "User-Agent": "..."},
+     *            "url_with_headers": "https://...m3u8|Referer=...&User-Agent=...",
+     *            "subtitles": [{"label": "English", "language": "en",
+     *                           "url": "https://...vtt", "default": true}, ...]}
+     *         or {"error": "..."} on failure.
+     *
+     * The `url_with_headers` field uses the pipe-encoded format that VLC,
+     * mpv, Kodi, and similar players accept on the command line / clipboard.
+     * ExoPlayer doesn't parse this format — it uses the `headers` map instead.
      */
     fun retrieveStream(
         @Suppress("UNUSED_PARAMETER") context: Context,
@@ -171,7 +195,7 @@ object MegaPlayScraper {
         val dataId = dataIdMatch.groupValues[1]
         Log.d(TAG, "megaplay data-id = $dataId")
 
-        // Step 2: GET getSourcesNew → JSON with m3u8 URL
+        // Step 2: GET getSourcesNew → JSON with m3u8 URL + tracks array
         val srcUrl = "$MEGAPLAY_BASE/stream/getSourcesNew?id=$dataId&id=$dataId"
         val srcJson = try {
             JSONObject(httpGet(srcUrl, embedUrl, "XMLHttpRequest"))
@@ -183,10 +207,127 @@ object MegaPlayScraper {
         return if (!fileUrl.isNullOrEmpty() &&
             (".m3u8" in fileUrl || ".mp4" in fileUrl)) {
             Log.d(TAG, "m3u8 = $fileUrl")
-            mapOf("url" to fileUrl)
+
+            // The CDN requires Referer: https://megaplay.buzz/ on every request.
+            // User-Agent isn't strictly required by the CDN, but we include a
+            // browser UA anyway because some segment URLs redirect to ad
+            // domains that may be pickier.
+            val headers = mapOf(
+                "Referer" to "https://megaplay.buzz/",
+                "User-Agent" to UA,
+            )
+
+            // Pipe-encoded URL for players that support the format
+            // (VLC, mpv, Kodi, ffplay, etc.). Header values are URL-encoded
+            // so special characters don't break the format.
+            val urlWithHeaders = buildPipeUrl(fileUrl, headers)
+
+            // Parse the subtitle tracks array.
+            // Megaplay returns tracks like:
+            //   {"file": "https://.../subtitles/eng-2.vtt",
+            //    "label": "English", "kind": "captions", "default": true}
+            // We translate these into a simpler shape that the player app
+            // can consume directly. The `language` field is a 2-letter ISO
+            // 639-1 code parsed from the label (falls back to "und").
+            val subtitles = parseSubtitleTracks(srcJson.optJSONArray("tracks"))
+
+            Log.d(TAG, "subtitles: ${subtitles.size} track(s)")
+            for (sub in subtitles) {
+                Log.d(TAG, "  ${sub["label"]} (${sub["language"]}) default=${sub["default"]}")
+            }
+
+            mapOf(
+                "url" to fileUrl,
+                "headers" to headers,
+                "url_with_headers" to urlWithHeaders,
+                "subtitles" to subtitles,
+            )
         } else {
             mapOf("error" to "No stream URL in megaplay response.")
         }
+    }
+
+    /**
+     * Parse megaplay's `tracks` JSON array into a list of subtitle maps.
+     *
+     * Each output entry has:
+     *   - label:    Human-readable name (e.g. "English")
+     *   - language: ISO 639-1 code (e.g. "en") — parsed from the label
+     *   - url:      VTT file URL
+     *   - default:  true if the player should auto-enable this track
+     *
+     * Skips tracks that aren't `kind=captions` (e.g. thumbnails).
+     */
+    private fun parseSubtitleTracks(tracks: org.json.JSONArray?): List<Map<String, Any>> {
+        if (tracks == null) return emptyList()
+        val result = mutableListOf<Map<String, Any>>()
+        for (i in 0 until tracks.length()) {
+            val track = tracks.optJSONObject(i) ?: continue
+            val kind = track.optString("kind", "")
+            if (kind != "captions") continue  // skip non-subtitle tracks
+
+            val label = track.optString("label", "Unknown")
+            val file = track.optString("file", "")
+            if (file.isEmpty()) continue
+
+            val isDefault = track.optBoolean("default", false)
+            val language = labelToLanguageCode(label)
+
+            result.add(mapOf(
+                "label" to label,
+                "language" to language,
+                "url" to file,
+                "default" to isDefault,
+            ))
+        }
+        return result
+    }
+
+    /**
+     * Convert a megaplay subtitle label like "English" or "Spanish - Spanish(Latin_America)"
+     * into a 2-letter ISO 639-1 language code. Falls back to "und" (undefined).
+     */
+    private fun labelToLanguageCode(label: String): String {
+        // Take the first word of the label, lowercase it, and match against
+        // a small lookup table. Megaplay uses English-language labels.
+        val firstWord = label.substringBefore(" ").lowercase().trim()
+        return when (firstWord) {
+            "arabic" -> "ar"
+            "english" -> "en"
+            "french" -> "fr"
+            "german" -> "de"
+            "italian" -> "it"
+            "portuguese" -> "pt"
+            "russian" -> "ru"
+            "spanish" -> "es"
+            "chinese" -> "zh"
+            "japanese" -> "ja"
+            "korean" -> "ko"
+            "dutch" -> "nl"
+            "polish" -> "pl"
+            "turkish" -> "tr"
+            "ukrainian" -> "uk"
+            "hindi" -> "hi"
+            "indonesian" -> "id"
+            "thai" -> "th"
+            "vietnamese" -> "vi"
+            else -> "und"
+        }
+    }
+
+    /**
+     * Build a pipe-encoded URL with headers, e.g.:
+     *   https://example.com/stream.m3u8|Referer=https%3A%2F%2Fmegaplay.buzz%2F&User-Agent=Mozilla%2F5.0...
+     *
+     * This format is understood by VLC, mpv, Kodi, and ffplay. ExoPlayer
+     * doesn't parse it — use the `headers` map for ExoPlayer instead.
+     */
+    private fun buildPipeUrl(url: String, headers: Map<String, String>): String {
+        if (headers.isEmpty()) return url
+        val encoded = headers.entries.joinToString("&") { (k, v) ->
+            "${java.net.URLEncoder.encode(k, "UTF-8")}=${java.net.URLEncoder.encode(v, "UTF-8")}"
+        }
+        return "$url|$encoded"
     }
 
     // =========================================================================
