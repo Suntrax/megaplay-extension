@@ -19,9 +19,14 @@ import org.json.JSONObject
  *   content://com.blissless.megaplay.provider/scrape?anime=<name>&anilistId=<id>
  *   → {"episodes": [{"number":"1","langs":["sub","dub"]}, ...]}
  *
- * **Mode 2 — Single stream** (with `episode` + `lang` params):
+ * **Mode 2 — Stream** (with `episode` + `lang` params):
  *   content://com.blissless.megaplay.provider/scrape?anilistId=<id>&episode=1&lang=sub
- *   → {"url": "https://...master.m3u8"}
+ *   → {"url": "...", "headers": {...}, "url_with_headers": "...", "subtitles": [...],
+ *      "streams": [{"lang":"sub","default":true,...}, {"lang":"dub","default":false,...}]}
+ *
+ * The `streams` array contains BOTH sub and dub (requested lang first). The
+ * top-level `url`/`headers`/etc. fields mirror the requested lang for
+ * backwards compatibility.
  *
  * Errors:
  *   {"error": "Description of what went wrong."}
@@ -56,13 +61,10 @@ class ScraperProvider : ContentProvider() {
         val cursor = MatrixCursor(arrayOf("data"))
 
         try {
-            // Route between the two modes
             val result: Map<String, Any> = if (!episode.isNullOrBlank() && !lang.isNullOrBlank()) {
-                // Mode 2: fetch a single m3u8
                 Log.d(TAG, "mode=stream anilistId=$anilistId ep=$episode lang=$lang")
                 MegaPlayScraper.retrieveStream(context!!, anilistId, episode, lang)
             } else {
-                // Mode 1: list episodes
                 Log.d(TAG, "mode=list anime=$animeName anilistId=$anilistId")
                 MegaPlayScraper.listEpisodes(animeName, anilistId)
             }
@@ -79,11 +81,12 @@ class ScraperProvider : ContentProvider() {
     /**
      * Convert the result map to a JSON string.
      *
-     * Handles four shapes:
+     * Handles three shapes:
      *   {"error": "..."}                       — error message
      *   {"url": "...", "headers": {...},
      *    "url_with_headers": "...",
-     *    "subtitles": [...]}                   — single stream URL (Mode 2)
+     *    "subtitles": [...],
+     *    "streams": [...]}                     — stream result (Mode 2)
      *   {"episodes": [...]}                    — episode list (Mode 1)
      */
     @Suppress("UNCHECKED_CAST")
@@ -98,7 +101,6 @@ class ScraperProvider : ContentProvider() {
         if (result.containsKey("url")) {
             obj.put("url", result["url"].toString())
 
-            // Serialise the headers map (if present) as a JSON object
             val headers = result["headers"] as? Map<String, String>
             if (headers != null) {
                 val headersObj = JSONObject()
@@ -108,24 +110,47 @@ class ScraperProvider : ContentProvider() {
                 obj.put("headers", headersObj)
             }
 
-            // Include the pipe-encoded URL (if present) for players that
-            // support the `url|Header=value&...` format.
             result["url_with_headers"]?.let { obj.put("url_with_headers", it.toString()) }
 
-            // Serialise the subtitles array (if present).
-            // Each entry: {"label": "...", "language": "...", "url": "...", "default": bool}
             val subtitles = result["subtitles"] as? List<Map<String, Any>>
             if (subtitles != null) {
-                val subsArr = JSONArray()
-                for (sub in subtitles) {
-                    val subObj = JSONObject()
-                    subObj.put("label", sub["label"].toString())
-                    subObj.put("language", sub["language"].toString())
-                    subObj.put("url", sub["url"].toString())
-                    subObj.put("default", sub["default"] as Boolean)
-                    subsArr.put(subObj)
+                obj.put("subtitles", serialiseSubtitles(subtitles))
+            }
+
+            // Serialise the streams array (both sub + dub, requested first).
+            // Each entry: {"lang": "sub", "default": true, "url": "...",
+            //              "headers": {...}, "url_with_headers": "...",
+            //              "subtitles": [...]}
+            val streams = result["streams"] as? List<Map<String, Any>>
+            if (streams != null) {
+                val streamsArr = JSONArray()
+                for (stream in streams) {
+                    val streamObj = JSONObject()
+                    streamObj.put("lang", stream["lang"].toString())
+                    streamObj.put("default", stream["default"] as Boolean)
+                    streamObj.put("url", stream["url"].toString())
+
+                    val streamHeaders = stream["headers"] as? Map<String, String>
+                    if (streamHeaders != null) {
+                        val hObj = JSONObject()
+                        for ((k, v) in streamHeaders) {
+                            hObj.put(k, v)
+                        }
+                        streamObj.put("headers", hObj)
+                    }
+
+                    stream["url_with_headers"]?.let {
+                        streamObj.put("url_with_headers", it.toString())
+                    }
+
+                    val streamSubs = stream["subtitles"] as? List<Map<String, Any>>
+                    if (streamSubs != null) {
+                        streamObj.put("subtitles", serialiseSubtitles(streamSubs))
+                    }
+
+                    streamsArr.put(streamObj)
                 }
-                obj.put("subtitles", subsArr)
+                obj.put("streams", streamsArr)
             }
 
             return obj.toString()
@@ -149,9 +174,23 @@ class ScraperProvider : ContentProvider() {
             return obj.toString()
         }
 
-        // Fallback: shouldn't happen, but return something useful
         obj.put("error", "Unexpected result shape: ${result.keys}")
         return obj.toString()
+    }
+
+    /** Helper: serialise a subtitles list to a JSONArray. */
+    @Suppress("UNCHECKED_CAST")
+    private fun serialiseSubtitles(subtitles: List<Map<String, Any>>): JSONArray {
+        val subsArr = JSONArray()
+        for (sub in subtitles) {
+            val subObj = JSONObject()
+            subObj.put("label", sub["label"].toString())
+            subObj.put("language", sub["language"].toString())
+            subObj.put("url", sub["url"].toString())
+            subObj.put("default", sub["default"] as Boolean)
+            subsArr.put(subObj)
+        }
+        return subsArr
     }
 
     override fun getType(uri: Uri): String? = null

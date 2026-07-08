@@ -35,14 +35,16 @@ thumbnail URL `.../bx{anilistId}-{hash}.png`), so the correct season is always
 picked — searching "Blue Lock" with `anilistId=137822` returns Season 1
 (24 episodes), not Season 2 (14 episodes).
 
-### Mode 2 — Single stream
+### Mode 2 — Stream
 
 ```
 content://com.blissless.megaplay.provider/scrape?anilistId=137822&episode=1&lang=sub
 ```
 
-Returns the m3u8 URL **plus the required headers and soft-subtitle tracks**
-for playback:
+Returns the m3u8 URL for the requested lang, **plus the other lang's stream
+too** (so the player can offer a sub↔dub toggle without a second round-trip).
+The requested lang is always first in the `streams` array and also duplicated
+into the top-level fields for backwards compatibility.
 
 ```json
 {
@@ -53,20 +55,48 @@ for playback:
   },
   "url_with_headers": "https://...master.m3u8|Referer=https%3A%2F%2Fmegaplay.buzz%2F&User-Agent=Mozilla%2F5.0...",
   "subtitles": [
-    {"label": "Arabic",                          "language": "ar", "url": "https://.../ara-6.vtt",  "default": false},
-    {"label": "English",                         "language": "en", "url": "https://.../eng-2.vtt",  "default": true },
-    {"label": "French",                          "language": "fr", "url": "https://.../fre-7.vtt",  "default": false},
-    {"label": "German",                          "language": "de", "url": "https://.../ger-8.vtt",  "default": false},
-    {"label": "Italian",                         "language": "it", "url": "https://.../ita-9.vtt",  "default": false},
-    {"label": "Portuguese - Portuguese(Brazil)", "language": "pt", "url": "https://.../por-3.vtt",  "default": false},
-    {"label": "Russian",                         "language": "ru", "url": "https://.../rus-10.vtt", "default": false},
-    {"label": "Spanish",                         "language": "es", "url": "https://.../spa-5.vtt",  "default": false},
-    {"label": "Spanish - Spanish(Latin_America)","language": "es", "url": "https://.../spa-4.vtt",  "default": false}
+    {"label": "English", "language": "en", "url": "https://.../eng-2.vtt", "default": true},
+    {"label": "Spanish", "language": "es", "url": "https://.../spa-5.vtt", "default": false}
+  ],
+  "streams": [
+    {
+      "lang": "sub",
+      "default": true,
+      "url": "https://9hjkrt.nekostream.site/.../master.m3u8",
+      "headers": {"Referer": "https://megaplay.buzz/", "User-Agent": "..."},
+      "url_with_headers": "https://...master.m3u8|Referer=...",
+      "subtitles": [
+        {"label": "English", "language": "en", "url": "https://.../eng-2.vtt", "default": true},
+        ...
+      ]
+    },
+    {
+      "lang": "dub",
+      "default": false,
+      "url": "https://9hjkrt.nekostream.site/.../master.m3u8",
+      "headers": {"Referer": "https://megaplay.buzz/", "User-Agent": "..."},
+      "url_with_headers": "https://...master.m3u8|Referer=...",
+      "subtitles": [
+        {"label": "English", "language": "en", "url": "https://.../eng-2.vtt", "default": true},
+        ...
+      ]
+    }
   ]
 }
 ```
 
-**HTTP calls:** 2 (megaplay embed page + megaplay getSourcesNew JSON).
+**HTTP calls:** 4 (2 for the requested lang + 2 for the other lang).
+
+### Why fetch both sub and dub?
+
+So the player can offer a "switch audio" toggle without making a second
+ContentProvider query. Costs 2 extra HTTP calls per stream request (4 total
+instead of 2), but saves a full extension round-trip + UI refresh when the
+user switches langs.
+
+If the other lang isn't available for this episode (e.g. dub not yet
+released), it's simply omitted from the `streams` array — the requested lang
+is always returned. The requested lang only failing returns an error.
 
 ### Subtitles
 
@@ -75,7 +105,8 @@ The player renders them as an overlay and the user can toggle them on/off,
 switch languages, or disable entirely.
 
 The extension parses megaplay's `tracks` array and returns a `subtitles` array
-with one entry per language:
+with one entry per language. Each subtitle array is per-stream (sub and dub
+can have different subtitle tracks):
 
 | Field      | Type    | Description                                                  |
 | ---------- | ------- | ------------------------------------------------------------ |
@@ -95,14 +126,15 @@ on **every** request — master m3u8, sub-playlist, AND segment files. Without
 it, the CDN returns HTTP 403. (Note: `Referer: https://mkissa.to/` is rejected
 by the CDN — only `megaplay.buzz` works.)
 
-The extension returns three fields to support different player types:
+The extension returns these fields to support different player types:
 
 | Field                | Use case                                                     |
 | -------------------- | ------------------------------------------------------------ |
-| `url`                | The plain m3u8 URL (for ExoPlayer — pair with `headers`)     |
+| `url`                | The plain m3u8 URL of the requested lang (for ExoPlayer — pair with `headers`) |
 | `headers`            | Map of required HTTP headers (for ExoPlayer's `setDefaultRequestProperties`) |
 | `url_with_headers`   | Pipe-encoded URL `url\|Header=value&...` (for VLC, mpv, Kodi, ffplay) |
-| `subtitles`          | Array of soft-subtitle VTT tracks (for ExoPlayer's `SubtitleConfiguration`) |
+| `subtitles`          | Array of soft-subtitle VTT tracks for the requested lang      |
+| `streams`            | Array of both sub + dub streams (requested lang first, `default: true`) |
 
 ### Errors
 
@@ -112,35 +144,30 @@ The extension returns three fields to support different player types:
 
 ## ExoPlayer integration
 
-Use the `url` + `headers` + `subtitles` fields with Media3. The subtitles need
-their own `DataSource.Factory` (or you can reuse the same one — the headers
-work for both video and subtitle CDNs since they share the same hash path):
+### Simple: play the requested lang only
+
+Use the top-level `url` + `headers` + `subtitles` fields (these always point
+to the user-requested lang):
 
 ```kotlin
-// 1. Build a DataSource.Factory that injects the Referer on every request
 val dataSourceFactory = DefaultHttpDataSource.Factory()
     .setUserAgent(headers["User-Agent"])
     .setDefaultRequestProperties(headers)
 
-// 2. Build subtitle configurations from the `subtitles` array
 val subtitleConfigs = subtitles.map { sub ->
     MediaItem.SubtitleConfiguration.Builder(Uri.parse(sub.url))
         .setMimeType(MimeTypes.TEXT_VTT)
         .setLanguage(sub.language)
         .setLabel(sub.label)
-        .setSelectionFlags(
-            if (sub.default) C.SELECTION_FLAG_DEFAULT else 0
-        )
+        .setSelectionFlags(if (sub.default) C.SELECTION_FLAG_DEFAULT else 0)
         .build()
 }
 
-// 3. Build the MediaItem with both the video URL and the subtitle tracks
 val mediaItem = MediaItem.Builder()
     .setUri(url)
     .setSubtitleConfigurations(subtitleConfigs)
     .build()
 
-// 4. Build the player with the DataSource attached
 val player = ExoPlayer.Builder(context)
     .setMediaSourceFactory(
         DefaultMediaSourceFactory(context).setDataSourceFactory(dataSourceFactory)
@@ -150,9 +177,38 @@ player.setMediaItem(mediaItem)
 player.prepare()
 ```
 
-ExoPlayer will auto-enable the track marked `default: true` on first play, and
-the user can switch languages via the player UI. The same `Referer` header is
-applied to both video segment requests and subtitle file requests.
+### Advanced: sub↔dub switching via the `streams` array
+
+To let the user switch between sub and dub without re-querying the extension,
+iterate the `streams` array and build a `MediaItem` for the selected one. The
+stream with `"default": true` is the one the user originally requested:
+
+```kotlin
+// Pick the stream to play (default = user's requested lang)
+val stream = streams.first { it.default }
+// ...or let the user pick: streams.first { it.lang == "dub" }
+
+val dataSourceFactory = DefaultHttpDataSource.Factory()
+    .setUserAgent(stream.headers["User-Agent"])
+    .setDefaultRequestProperties(stream.headers)
+
+val subtitleConfigs = stream.subtitles.map { sub ->
+    MediaItem.SubtitleConfiguration.Builder(Uri.parse(sub.url))
+        .setMimeType(MimeTypes.TEXT_VTT)
+        .setLanguage(sub.language)
+        .setLabel(sub.label)
+        .setSelectionFlags(if (sub.default) C.SELECTION_FLAG_DEFAULT else 0)
+        .build()
+}
+
+val mediaItem = MediaItem.Builder()
+    .setUri(stream.url)
+    .setSubtitleConfigurations(subtitleConfigs)
+    .build()
+
+// When the user switches lang, just call player.setMediaItem(newMediaItem)
+// — no need to re-query the extension.
+```
 
 Or use OkHttp with an interceptor (Tensei main app uses this approach):
 
@@ -174,7 +230,8 @@ val dataSourceFactory = OkHttpDataSource.Factory(client)
 Fetching the m3u8 for every episode upfront would be 2×N HTTP calls (e.g. 48
 for a 24-episode show with sub+dub). Instead, the extension returns the episode
 list cheaply (2 calls), and the AnimeClient only requests the m3u8 for the
-specific episode the user selects (2 more calls).
+specific episode the user selects (4 more calls — 2 for the requested lang +
+2 for the other lang so the player can offer a sub↔dub toggle).
 
 ## Pipeline
 
@@ -186,11 +243,13 @@ specific episode the user selects (2 more calls).
 
 ### Stream URL (Mode 2)
 
-1. `GET https://megaplay.buzz/stream/ani/<anilistId>/<ep>/<lang>` → HTML page
-   with a `data-id="..."` attribute on `#megaplay-player`.
-2. `GET https://megaplay.buzz/stream/getSourcesNew?id=<data_id>` → JSON with
-   `sources.file` containing the m3u8 URL.
-3. Attach the required `Referer` + `User-Agent` headers to the response.
+1. Fetch the **requested lang**:
+   - `GET https://megaplay.buzz/stream/ani/<anilistId>/<ep>/<lang>` → HTML with `data-id`
+   - `GET https://megaplay.buzz/stream/getSourcesNew?id=<data_id>` → JSON with `sources.file` + `tracks`
+2. Fetch the **other lang** (best-effort — failure is OK):
+   - Same two requests with the other lang's URL
+3. Build the `streams` array (requested lang first, `default: true`).
+4. Attach the required `Referer` + `User-Agent` headers to every stream entry.
 
 mkissa.to embeds megaplay as one of its source providers, so the URL megaplay
 returns IS one of mkissa's source URLs. We use megaplay directly because it
@@ -206,6 +265,7 @@ Two different referrers are used, for two different purposes:
 | megaplay.buzz embed     | `https://mkissa.to/`         | megaplay checks the referrer to authorise the embed load |
 | megaplay getSourcesNew  | (the megaplay embed URL)     | megaplay checks the referrer is its own page |
 | Stream CDN (nekostream) | `https://megaplay.buzz/`     | CDN requires megaplay.buzz as referrer, returns 403 otherwise |
+| Subtitle CDN (lostproject) | `https://megaplay.buzz/`  | Same hash path as video, requires same referrer |
 
 ## Package info
 
